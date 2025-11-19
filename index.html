@@ -1,0 +1,815 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Shield, Zap, Crosshair, HelpCircle, RefreshCw, Trophy } from 'lucide-react';
+
+/**
+ * --- CONFIGURATION & CONSTANTS ---
+ */
+const FPS = 60;
+const DT = 1 / FPS;
+const GRAVITY = 800;
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const ROUND_DURATION = 15;
+
+// Neon Palette
+const THEME = {
+  p1: '#4cc9f0', // Cyan
+  p1Glow: 'rgba(76, 201, 240, 0.6)',
+  p2: '#f72585', // Pink
+  p2Glow: 'rgba(247, 37, 133, 0.6)',
+  grid: '#3a0ca3',
+  text: '#e94560',
+};
+
+const CLASSES = {
+  warrior: { hp: 150, speed: 180, fuel: 2.0, width: 32, height: 44, cooldown: 0.5, type: 'melee', icon: Shield, desc: 'Heavy Melee' },
+  wizard:  { hp: 100, speed: 140, fuel: 1.0, width: 30, height: 40, cooldown: 1.2, type: 'bomb', icon: Zap, desc: 'Artillery' },
+  ranger:  { hp: 75,  speed: 240, fuel: 3.0, width: 26, height: 36, cooldown: 0.8, type: 'laser', icon: Crosshair, desc: 'Sniper' }
+};
+
+/**
+ * --- REACT BITS INSPIRED COMPONENTS ---
+ */
+
+// 1. Retro Perspective Grid Background
+const RetroGrid = () => {
+  return (
+    <div className="absolute inset-0 overflow-hidden pointer-events-none z-0">
+      <div className="absolute inset-0 bg-[#050510]" />
+      <div 
+        className="absolute inset-0 opacity-30"
+        style={{
+          backgroundImage: `linear-gradient(to right, ${THEME.grid} 1px, transparent 1px),
+                            linear-gradient(to bottom, ${THEME.grid} 1px, transparent 1px)`,
+          backgroundSize: '40px 40px',
+          transform: 'perspective(500px) rotateX(60deg) translateY(-100px) scale(2)',
+          animation: 'grid-move 20s linear infinite',
+          transformOrigin: 'top center'
+        }}
+      />
+      <div className="absolute inset-0 bg-gradient-to-t from-[#050510] via-transparent to-transparent" />
+      <style>{`
+        @keyframes grid-move {
+          0% { background-position: 0 0; }
+          100% { background-position: 0 400px; }
+        }
+      `}</style>
+    </div>
+  );
+};
+
+// 2. Glitch Text Effect Component
+const GlitchText = ({ text, color = 'white', size = 'text-4xl' }) => {
+  return (
+    <div className={`relative inline-block font-black ${size} tracking-tighter`} style={{ color }}>
+      <span className="relative z-10">{text}</span>
+      <span className="absolute top-0 left-0 -z-10 opacity-70 animate-pulse text-[#0ff] translate-x-[2px] mix-blend-screen">{text}</span>
+      <span className="absolute top-0 left-0 -z-10 opacity-70 animate-pulse text-[#f0f] -translate-x-[2px] mix-blend-screen">{text}</span>
+    </div>
+  );
+};
+
+// 3. CRT Scanline Overlay
+const CRTOverlay = () => (
+  <div className="absolute inset-0 pointer-events-none z-50 overflow-hidden opacity-20">
+    <div className="w-full h-full bg-[linear-gradient(rgba(18,16,16,0)50%,rgba(0,0,0,0.25)50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] bg-[length:100%_2px,3px_100%]" />
+  </div>
+);
+
+/**
+ * --- MAIN GAME COMPONENT ---
+ */
+export default function ChronosArena() {
+  // -- React State for UI --
+  const [uiState, setUiState] = useState({
+    phase: 'start', // start, select, playing, gameover
+    turn: 1,
+    round: 1,
+    p1Score: 0,
+    p2Score: 0,
+    p1Used: [],
+    p2Used: [],
+    winner: null,
+    timeLeft: ROUND_DURATION,
+    showHelp: true, // Show help initially
+  });
+
+  // -- Refs for Game Engine (Mutable, High Performance) --
+  const canvasRef = useRef(null);
+  const requestRef = useRef(null);
+  const gameState = useRef({
+    active: false,
+    history: [],
+    entities: [],
+    projectiles: [],
+    platforms: [],
+    particles: [],
+    shake: 0,
+    gameTime: ROUND_DURATION, // LOGIC TIMER in Ref
+  });
+  
+  const inputState = useRef({
+    keys: { w: false, a: false, s: false, d: false },
+    mouse: { x: 0, y: 0, down: false },
+    currentRec: []
+  });
+
+  // -- Initialization --
+  useEffect(() => {
+    generateMap();
+    // Key Listeners
+    const handleDown = (e) => { if (inputState.current.keys.hasOwnProperty(e.key.toLowerCase())) inputState.current.keys[e.key.toLowerCase()] = true; };
+    const handleUp = (e) => { if (inputState.current.keys.hasOwnProperty(e.key.toLowerCase())) inputState.current.keys[e.key.toLowerCase()] = false; };
+    
+    window.addEventListener('keydown', handleDown);
+    window.addEventListener('keyup', handleUp);
+    return () => {
+      window.removeEventListener('keydown', handleDown);
+      window.removeEventListener('keyup', handleUp);
+      cancelAnimationFrame(requestRef.current);
+    };
+  }, []);
+
+  // -- Map Generation --
+  const generateMap = () => {
+    const platforms = [];
+    // Boundaries
+    platforms.push({ x: 0, y: CANVAS_HEIGHT - 40, w: CANVAS_WIDTH, h: 40, type: 'floor' });
+    platforms.push({ x: 0, y: -100, w: CANVAS_WIDTH, h: 100, type: 'wall' });
+    platforms.push({ x: -50, y: 0, w: 50, h: CANVAS_HEIGHT, type: 'wall' });
+    platforms.push({ x: CANVAS_WIDTH, y: 0, w: 50, h: CANVAS_HEIGHT, type: 'wall' });
+
+    // Tiers
+    const tiers = 3;
+    const tierHeight = 130;
+    for (let t = 1; t <= tiers; t++) {
+      let y = CANVAS_HEIGHT - 40 - (t * tierHeight);
+      let x = 50;
+      while (x < CANVAS_WIDTH - 100) {
+        const width = 80 + Math.random() * 150;
+        const gap = 60 + Math.random() * 60;
+        platforms.push({ x, y, w: width, h: 20, type: 'plat' });
+        if (Math.random() > 0.7) platforms.push({ x: x + width/2 - 10, y: y - 60, w: 20, h: 60, type: 'cover' });
+        x += width + gap;
+      }
+    }
+    gameState.current.platforms = platforms;
+  };
+
+  // -- Game Loop Management --
+  const startGameLoop = () => {
+    let lastTime = performance.now();
+    let accumulator = 0;
+
+    const loop = (time) => {
+      if (!gameState.current.active) return;
+      
+      const dt = (time - lastTime) / 1000;
+      lastTime = time;
+      accumulator += dt;
+
+      // Physics Update (Fixed Timestep)
+      while (accumulator >= DT) {
+        updatePhysics(DT);
+        accumulator -= DT;
+      }
+      
+      // Sync UI Timer from Ref to State (Once per frame for smoothness)
+      setUiState(prev => ({ ...prev, timeLeft: gameState.current.gameTime }));
+
+      // Render
+      draw();
+      requestRef.current = requestAnimationFrame(loop);
+    };
+    requestRef.current = requestAnimationFrame(loop);
+  };
+
+  // -- Physics Engine --
+  const updatePhysics = (dt) => {
+    const state = gameState.current;
+
+    // 1. Update Logic Timer directly in Ref
+    state.gameTime -= dt;
+
+    // 2. Check End Condition based on Ref
+    if (state.gameTime <= 0) {
+      endTurn();
+      return;
+    }
+
+    // Input Recording
+    const activePlayer = state.entities.find(e => !e.isGhost && !e.dead);
+    const inputSnapshot = {
+      keys: { ...inputState.current.keys },
+      aim: Math.atan2(inputState.current.mouse.y - (activePlayer ? (activePlayer.y + activePlayer.height/2) : 0), 
+                      inputState.current.mouse.x - (activePlayer ? (activePlayer.x + activePlayer.width/2) : 0)),
+      shoot: inputState.current.mouse.down
+    };
+
+    if (activePlayer) {
+      inputState.current.currentRec.push(inputSnapshot);
+      updateEntity(activePlayer, dt, inputSnapshot);
+    } else {
+      // Record dead air
+      inputState.current.currentRec.push({ keys: {w:false,a:false,s:false,d:false}, aim: 0, shoot: false });
+    }
+
+    // Update Ghosts & Others
+    state.entities.forEach(e => {
+      if (e.isGhost) updateEntity(e, dt);
+    });
+
+    // Projectiles
+    for (let i = state.projectiles.length - 1; i >= 0; i--) {
+      updateProjectile(state.projectiles[i], i, dt);
+    }
+
+    // Particles
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      let p = state.particles[i];
+      p.life -= dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.gravity) p.vy += GRAVITY * dt * 0.5;
+      if (p.life <= 0) state.particles.splice(i, 1);
+    }
+
+    // Screen Shake Decay
+    if (state.shake > 0) state.shake *= 0.9;
+  };
+
+  const updateEntity = (e, dt, liveInput = null) => {
+    if (e.dead) return;
+    e.bobOffset += dt * 5;
+
+    let input;
+    if (e.isGhost) {
+      if (e.tickIndex < e.inputLog.length) {
+        input = e.inputLog[e.tickIndex];
+        e.tickIndex++;
+      } else {
+        killEntity(e);
+        return;
+      }
+    } else {
+      input = liveInput;
+    }
+
+    // Movement
+    if (input.keys.a) { e.vx = -e.stats.speed; e.facingRight = false; }
+    else if (input.keys.d) { e.vx = e.stats.speed; e.facingRight = true; }
+    else { e.vx = 0; }
+
+    // Jetpack
+    if (input.keys.w && e.fuel > 0) {
+      e.vy -= 30;
+      e.vy = Math.max(e.vy, -350);
+      e.fuel--;
+      if (Math.random() > 0.5) createParticle(e.x + e.width/2, e.y + e.height, e.playerId === 1 ? THEME.p1 : THEME.p2, 0.5, 50);
+    }
+
+    // Physics
+    e.vy += GRAVITY * dt;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+
+    // Constraints
+    const floorY = CANVAS_HEIGHT - 40 - e.height;
+    if (e.x < 0) { e.x = 0; e.vx = 0; }
+    else if (e.x > CANVAS_WIDTH - e.width) { e.x = CANVAS_WIDTH - e.width; e.vx = 0; }
+    if (e.y > floorY) { e.y = floorY; e.vy = 0; e.onGround = true; }
+    if (e.y < floorY) e.onGround = false;
+
+    // Collisions
+    gameState.current.platforms.forEach(p => {
+      if (rectIntersect(e, p)) resolvePlatCollision(e, p);
+    });
+    gameState.current.entities.forEach(other => {
+      if (other !== e && !other.dead && rectIntersect(e, other)) resolveEntityCollision(e, other);
+    });
+
+    // Fuel
+    if (e.onGround && e.fuel < e.maxFuel) e.fuel += 2;
+
+    // Attack
+    if (e.cooldownTimer > 0) e.cooldownTimer -= dt;
+    if (input.shoot && e.cooldownTimer <= 0) {
+      performAttack(e, input.aim);
+      e.cooldownTimer = e.stats.cooldown;
+    }
+  };
+
+  const performAttack = (e, angle) => {
+    const cx = e.x + e.width/2;
+    const cy = e.y + e.height/2;
+    const color = e.playerId === 1 ? THEME.p1 : THEME.p2;
+
+    if (e.classType === 'warrior') {
+      // Melee
+      const hx = cx + Math.cos(angle) * 70;
+      const hy = cy + Math.sin(angle) * 70;
+      createSlashEffect(cx, cy, angle, color);
+      gameState.current.shake = 5;
+      gameState.current.entities.forEach(target => {
+        if (target === e || target.dead || target.playerId === e.playerId) return;
+        const dx = (target.x + target.width/2) - hx;
+        const dy = (target.y + target.height/2) - hy;
+        if (Math.sqrt(dx*dx + dy*dy) < 50) damageEntity(target, 50);
+      });
+    } else {
+      // Projectile
+      gameState.current.projectiles.push({
+        x: cx, y: cy,
+        vx: Math.cos(angle) * (e.classType === 'ranger' ? 900 : 500),
+        vy: Math.sin(angle) * (e.classType === 'ranger' ? 900 : 500),
+        type: e.classType,
+        ownerId: e.playerId,
+        life: e.classType === 'ranger' ? 1.5 : 2.0,
+        radius: e.classType === 'ranger' ? 4 : 8,
+        color: color
+      });
+    }
+  };
+
+  const updateProjectile = (p, idx, dt) => {
+    p.life -= dt;
+    if (p.type === 'bomb') p.vy += GRAVITY * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+
+    // Trail
+    if (Math.random() > 0.2) createParticle(p.x, p.y, p.color, 0.2, 10);
+
+    let hit = false;
+    // World
+    if (gameState.current.platforms.some(plat => p.x > plat.x && p.x < plat.x + plat.w && p.y > plat.y && p.y < plat.y + plat.h)) hit = true;
+    
+    // Entities
+    if (!hit) {
+      for (let e of gameState.current.entities) {
+        if (e.dead || e.playerId === p.ownerId) continue;
+        if (p.x > e.x && p.x < e.x + e.width && p.y > e.y && p.y < e.y + e.height) {
+          hit = true;
+          damageEntity(e, p.type === 'bomb' ? 20 : 35);
+          break;
+        }
+      }
+    }
+
+    if (hit || p.life <= 0) {
+      if (p.type === 'bomb') {
+        gameState.current.shake = 5;
+        // Splash
+        gameState.current.entities.forEach(e => {
+          if (e.dead) return;
+          const dist = Math.hypot((e.x + e.width/2) - p.x, (e.y + e.height/2) - p.y);
+          if (dist < 80) damageEntity(e, 40 * (1 - dist/80));
+        });
+        for(let k=0; k<15; k++) createParticle(p.x, p.y, '#ffa500', 0.5, 150);
+      } else {
+        createParticle(p.x, p.y, p.color, 0.3, 50);
+      }
+      gameState.current.projectiles.splice(idx, 1);
+    }
+  };
+
+  const damageEntity = (e, amount) => {
+    e.hp -= amount;
+    gameState.current.shake = 10;
+    // Blood
+    for(let i=0; i<5; i++) createParticle(e.x + e.width/2, e.y + e.height/2, e.playerId === 1 ? THEME.p1 : THEME.p2, 0.4, 80);
+    
+    if (e.hp <= 0) killEntity(e);
+  };
+
+  const killEntity = (e) => {
+    e.dead = true;
+    e.hp = 0;
+    gameState.current.shake = 20;
+    // Death Explosion
+    for(let i=0; i<30; i++) createParticle(e.x + e.width/2, e.y + e.height/2, e.playerId === 1 ? THEME.p1 : THEME.p2, 1.0, 200, true);
+    
+    // Update Score (Need to be careful updating state from physics loop)
+    // We'll assume 1 kill = 1 point instantly
+    setUiState(prev => ({
+      ...prev,
+      p1Score: e.playerId === 2 ? prev.p1Score + 1 : prev.p1Score,
+      p2Score: e.playerId === 1 ? prev.p2Score + 1 : prev.p2Score
+    }));
+  };
+
+  // -- Helpers --
+  const createParticle = (x, y, color, life, speed, gravity = false) => {
+    gameState.current.particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * speed,
+      vy: (Math.random() - 0.5) * speed,
+      life, maxLife: life, color, gravity,
+      size: Math.random() * 3 + 1
+    });
+  };
+
+  const createSlashEffect = (x, y, angle, color) => {
+    for(let i=0; i<10; i++) {
+      gameState.current.particles.push({
+        x: x + Math.cos(angle) * 30,
+        y: y + Math.sin(angle) * 30,
+        vx: Math.cos(angle + (Math.random()-0.5)) * 200,
+        vy: Math.sin(angle + (Math.random()-0.5)) * 200,
+        life: 0.2, maxLife: 0.2, color: '#fff', size: 2
+      });
+    }
+  };
+
+  const rectIntersect = (r1, r2) => !(r2.x > r1.x + r1.width || r2.x + r2.w < r1.x || r2.y > r1.y + r1.height || r2.y + r2.h < r1.y);
+
+  const resolvePlatCollision = (e, p) => {
+    const dx = (e.x + e.width/2) - (p.x + p.w/2);
+    const dy = (e.y + e.height/2) - (p.y + p.h/2);
+    const width = (e.width + p.w) / 2;
+    const height = (e.height + p.h) / 2;
+    const crossWidth = width * dy;
+    const crossHeight = height * dx;
+
+    if (Math.abs(dx) <= width && Math.abs(dy) <= height) {
+      if (crossWidth > crossHeight) {
+        if (crossWidth > -crossHeight) { e.y = p.y + p.h; e.vy = 0; } // Bottom
+        else { e.x = p.x - e.width; e.vx = 0; } // Left
+      } else {
+        if (crossWidth > -crossHeight) { e.x = p.x + p.w; e.vx = 0; } // Right
+        else { e.y = p.y - e.height; e.vy = 0; e.onGround = true; } // Top
+      }
+    }
+  };
+
+  const resolveEntityCollision = (e1, e2) => {
+    const dx = (e1.x + e1.width/2) - (e2.x + e2.width/2);
+    const dy = (e1.y + e1.height/2) - (e2.y + e2.height/2);
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist < 30 && dist > 0) {
+      const pushX = (dx / dist) * 2;
+      const pushY = (dy / dist) * 2;
+      e1.x += pushX; e1.y += pushY;
+    }
+  };
+
+  // -- Turn Logic --
+  const startTurn = (charType) => {
+    // Commit Selection
+    if (uiState.turn === 1) uiState.p1Used.push(charType);
+    else uiState.p2Used.push(charType);
+
+    // Reset State for Turn
+    gameState.current.active = true;
+    gameState.current.gameTime = ROUND_DURATION; // RESET LOGIC TIMER
+    gameState.current.projectiles = [];
+    gameState.current.particles = [];
+    gameState.current.entities = [];
+    inputState.current.currentRec = [];
+    setUiState(prev => ({ ...prev, phase: 'playing', timeLeft: ROUND_DURATION }));
+
+    // Spawn Ghosts
+    gameState.current.history.forEach(rec => {
+      const sx = rec.playerId === 1 ? 50 : CANVAS_WIDTH - 80;
+      gameState.current.entities.push({
+        x: sx, y: 50, vx:0, vy:0,
+        classType: rec.charType, stats: CLASSES[rec.charType],
+        hp: CLASSES[rec.charType].hp, maxHp: CLASSES[rec.charType].hp,
+        fuel: CLASSES[rec.charType].fuel * 60, maxFuel: CLASSES[rec.charType].fuel * 60,
+        width: CLASSES[rec.charType].width, height: CLASSES[rec.charType].height,
+        playerId: rec.playerId, isGhost: true, inputLog: rec.inputs, tickIndex: 0,
+        dead: false, cooldownTimer: 0, bobOffset: Math.random()*10
+      });
+    });
+
+    // Spawn Player
+    const sx = uiState.turn === 1 ? 50 : CANVAS_WIDTH - 80;
+    gameState.current.entities.push({
+      x: sx, y: 50, vx:0, vy:0,
+      classType: charType, stats: CLASSES[charType],
+      hp: CLASSES[charType].hp, maxHp: CLASSES[charType].hp,
+      fuel: CLASSES[charType].fuel * 60, maxFuel: CLASSES[charType].fuel * 60,
+      width: CLASSES[charType].width, height: CLASSES[charType].height,
+      playerId: uiState.turn, isGhost: false,
+      dead: false, cooldownTimer: 0, bobOffset: 0
+    });
+
+    startGameLoop();
+  };
+
+  const endTurn = () => {
+    gameState.current.active = false;
+    cancelAnimationFrame(requestRef.current);
+
+    const activeChar = uiState.turn === 1 ? uiState.p1Used[uiState.p1Used.length-1] : uiState.p2Used[uiState.p2Used.length-1];
+    
+    // Save History
+    gameState.current.history.push({
+      playerId: uiState.turn,
+      charType: activeChar,
+      inputs: inputState.current.currentRec
+    });
+
+    // Next Turn Calc
+    let nextTurn = uiState.turn === 1 ? 2 : 1;
+    let nextRound = uiState.round;
+    if (nextTurn === 1) nextRound++;
+
+    if (nextRound > 3) {
+      setUiState(prev => ({ ...prev, phase: 'gameover', winner: prev.p1Score > prev.p2Score ? 1 : prev.p2Score > prev.p1Score ? 2 : 0 }));
+    } else {
+      setUiState(prev => ({ ...prev, phase: 'select', turn: nextTurn, round: nextRound, timeLeft: ROUND_DURATION }));
+    }
+  };
+
+  const restartGame = () => {
+    gameState.current.history = [];
+    setUiState({
+      phase: 'start', turn: 1, round: 1, p1Score: 0, p2Score: 0,
+      p1Used: [], p2Used: [], winner: null, timeLeft: ROUND_DURATION, showHelp: false
+    });
+  };
+
+  // -- Rendering --
+  const draw = () => {
+    const ctx = canvasRef.current.getContext('2d');
+    const { platforms, projectiles, particles, entities, shake } = gameState.current;
+
+    ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    
+    // Shake
+    const sx = (Math.random() - 0.5) * shake;
+    const sy = (Math.random() - 0.5) * shake;
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    // Platforms (Neon Rects)
+    platforms.forEach(p => {
+      if (p.type === 'wall') return;
+      ctx.shadowBlur = 15;
+      ctx.shadowColor = THEME.grid;
+      ctx.strokeStyle = THEME.p1;
+      ctx.fillStyle = 'rgba(13, 18, 30, 0.9)';
+      ctx.lineWidth = 2;
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.strokeRect(p.x, p.y, p.w, p.h);
+      ctx.shadowBlur = 0;
+    });
+
+    // Entities
+    entities.forEach(e => {
+      if (e.dead) return;
+      const cx = e.x + e.width/2;
+      const cy = e.y + e.height/2;
+      const bob = Math.sin(e.bobOffset) * 3;
+      const color = e.playerId === 1 ? THEME.p1 : THEME.p2;
+
+      ctx.save();
+      ctx.translate(cx, cy + bob);
+      
+      if (e.isGhost) {
+        ctx.globalAlpha = 0.5;
+        if (Math.random() > 0.9) ctx.translate((Math.random()-0.5)*4, 0); // Glitch
+      }
+
+      // Glow
+      ctx.shadowBlur = e.isGhost ? 5 : 20;
+      ctx.shadowColor = color;
+      ctx.fillStyle = color;
+
+      // Draw Shape
+      if (e.classType === 'warrior') {
+        ctx.fillRect(-15, -20, 30, 40);
+        ctx.fillStyle = '#fff'; ctx.fillRect(-10, -15, 20, 8); // Visor
+      } else if (e.classType === 'wizard') {
+        ctx.beginPath(); ctx.moveTo(0, -25); ctx.lineTo(15, 20); ctx.lineTo(-15, 20); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, -32, 4, 0, Math.PI*2); ctx.fill(); // Orb
+      } else {
+        ctx.beginPath(); ctx.moveTo(0, -20); ctx.lineTo(12, 10); ctx.lineTo(0, 18); ctx.lineTo(-12, 10); ctx.fill();
+        ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(0, -5, 3, 0, Math.PI*2); ctx.fill(); // Eye
+      }
+
+      // Health Bar
+      ctx.shadowBlur = 0;
+      const hpPct = e.hp / e.maxHp;
+      ctx.fillStyle = '#111'; ctx.fillRect(-16, -e.height/2 - 16, 32, 6);
+      ctx.fillStyle = hpPct > 0.5 ? '#0f0' : '#f00'; ctx.fillRect(-15, -e.height/2 - 15, 30 * hpPct, 4);
+
+      ctx.restore();
+    });
+
+    // Projectiles
+    projectiles.forEach(p => {
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = p.color;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI*2); ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+
+    // Particles
+    particles.forEach(p => {
+      ctx.globalAlpha = p.life / p.maxLife;
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x, p.y, p.size, p.size);
+    });
+
+    ctx.restore();
+  };
+
+  // -- Mouse Tracking for Canvas --
+  const handleMouseMove = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    inputState.current.mouse.x = (e.clientX - rect.left) * (CANVAS_WIDTH / rect.width);
+    inputState.current.mouse.y = (e.clientY - rect.top) * (CANVAS_HEIGHT / rect.height);
+  };
+
+  return (
+    <div className="relative w-screen h-screen bg-black flex flex-col items-center justify-center overflow-hidden font-mono text-white selection:bg-pink-500 selection:text-white">
+      {/* -- LAYERS -- */}
+      <RetroGrid />
+      <CRTOverlay />
+
+      {/* -- HUD -- */}
+      <div className="absolute top-0 left-0 w-full p-6 flex justify-between items-start z-30 pointer-events-none">
+        {/* P1 Score */}
+        <div className="bg-slate-900/80 border-l-4 border-cyan-400 px-8 py-4 skew-x-[-10deg] shadow-[0_0_20px_rgba(76,201,240,0.3)] backdrop-blur-sm">
+          <div className="skew-x-[10deg] text-center">
+            <div className="text-xs text-cyan-300 tracking-[0.3em] mb-1">PLAYER 01</div>
+            <GlitchText text={uiState.p1Score} color={THEME.p1} size="text-5xl" />
+          </div>
+        </div>
+
+        {/* Timer */}
+        <div className="flex flex-col items-center bg-slate-900/80 border-b-4 border-yellow-400 px-10 py-4 rounded-b-lg shadow-[0_0_30px_rgba(255,200,0,0.2)] backdrop-blur-sm">
+          <div className="text-[10px] text-yellow-200 tracking-[0.4em] mb-1">TIMESCALE</div>
+          <div className="text-5xl font-black text-yellow-400 tracking-widest tabular-nums" style={{ textShadow: '0 0 20px gold' }}>
+            {Math.ceil(uiState.timeLeft)}
+          </div>
+          <div className="text-xs mt-2 text-gray-400">ROUND {uiState.round} / 3</div>
+        </div>
+
+        {/* P2 Score */}
+        <div className="bg-slate-900/80 border-r-4 border-pink-500 px-8 py-4 skew-x-[10deg] shadow-[0_0_20px_rgba(247,37,133,0.3)] backdrop-blur-sm">
+          <div className="skew-x-[-10deg] text-center">
+            <div className="text-xs text-pink-300 tracking-[0.3em] mb-1">PLAYER 02</div>
+            <GlitchText text={uiState.p2Score} color={THEME.p2} size="text-5xl" />
+          </div>
+        </div>
+      </div>
+
+      {/* -- CANVAS LAYER -- */}
+      <div className="relative z-10 p-1 rounded-lg bg-gradient-to-b from-gray-800 to-gray-900 shadow-2xl border border-gray-700">
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_WIDTH}
+          height={CANVAS_HEIGHT}
+          className="bg-[#0b0c15] rounded cursor-crosshair shadow-inner"
+          onMouseMove={handleMouseMove}
+          onMouseDown={() => inputState.current.mouse.down = true}
+          onMouseUp={() => inputState.current.mouse.down = false}
+        />
+        
+        {/* Help Toggle */}
+        <button 
+          onClick={() => setUiState(s => ({...s, showHelp: true}))}
+          className="absolute -right-16 top-0 w-12 h-12 bg-slate-800 border border-gray-600 rounded-full flex items-center justify-center hover:bg-cyan-500 hover:text-black transition-all duration-300 group pointer-events-auto"
+        >
+          <HelpCircle size={24} className="group-hover:rotate-12 transition-transform" />
+        </button>
+
+        {/* Controls Hint */}
+        <div className="absolute -bottom-12 left-1/2 -translate-x-1/2 text-xs text-gray-500 tracking-[0.3em] whitespace-nowrap opacity-70">
+          [ WASD ] THRUSTERS :: [ MOUSE ] BALLISTICS
+        </div>
+      </div>
+
+      {/* -- OVERLAYS -- */}
+
+      {/* 1. CHARACTER SELECT */}
+      {(uiState.phase === 'start' || uiState.phase === 'select') && !uiState.showHelp && (
+        <div className="absolute inset-0 z-40 bg-black/60 backdrop-blur-md flex flex-col items-center justify-center">
+          <div className="bg-slate-900/90 border border-cyan-500/30 p-10 rounded-2xl max-w-4xl w-full shadow-[0_0_100px_rgba(0,0,0,0.8)] transform transition-all">
+            <div className="text-center mb-10">
+              <h1 className="text-6xl font-black italic tracking-tighter mb-4">
+                <span className="text-white" style={{ textShadow: '4px 4px 0 #f72585' }}>CHRONOS</span>
+                <span className="text-[#4cc9f0]">SELECT</span>
+              </h1>
+              <div className={`text-2xl font-bold tracking-[0.2em] ${uiState.turn === 1 ? 'text-cyan-400' : 'text-pink-500'} animate-pulse`}>
+                PLAYER {uiState.turn} INITIALIZING...
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-6">
+              {['warrior', 'wizard', 'ranger'].map(cKey => {
+                const char = CLASSES[cKey];
+                const isUsed = uiState.turn === 1 ? uiState.p1Used.includes(cKey) : uiState.p2Used.includes(cKey);
+                return (
+                  <button
+                    key={cKey}
+                    disabled={isUsed}
+                    onClick={() => startTurn(cKey)}
+                    className={`
+                      relative group overflow-hidden p-6 rounded-xl border transition-all duration-300
+                      ${isUsed 
+                        ? 'border-gray-800 bg-gray-900/50 opacity-50 cursor-not-allowed grayscale' 
+                        : 'border-gray-700 bg-slate-800 hover:bg-slate-700 hover:border-cyan-400 hover:scale-105 hover:shadow-[0_0_30px_rgba(76,201,240,0.2)]'
+                      }
+                    `}
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <div className="flex flex-col items-center gap-4 relative z-10">
+                      <div className={`w-20 h-20 rounded-2xl flex items-center justify-center bg-gradient-to-br from-gray-800 to-black border border-gray-600 shadow-lg group-hover:shadow-[0_0_20px_${char.hp > 100 ? 'red' : char.hp > 80 ? 'purple' : 'green'}]`}>
+                        <char.icon size={40} className={cKey === 'warrior' ? 'text-red-500' : cKey === 'wizard' ? 'text-purple-500' : 'text-green-500'} />
+                      </div>
+                      <div className="text-center">
+                        <div className="text-2xl font-bold uppercase tracking-wider mb-1">{cKey}</div>
+                        <div className="text-xs text-gray-400 tracking-widest uppercase">{char.desc}</div>
+                      </div>
+                      {/* Stats Bar */}
+                      <div className="w-full bg-gray-900 h-1.5 rounded-full overflow-hidden mt-2">
+                        <div 
+                          className={`h-full ${cKey === 'warrior' ? 'bg-red-500' : cKey === 'wizard' ? 'bg-purple-500' : 'bg-green-500'}`} 
+                          style={{ width: `${(char.hp / 150) * 100}%` }} 
+                        />
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2. HELP MODAL */}
+      {uiState.showHelp && (
+        <div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-lg flex items-center justify-center p-4">
+          <div className="bg-slate-900 border-2 border-yellow-400/50 p-8 rounded-lg max-w-lg w-full relative overflow-hidden shadow-[0_0_50px_rgba(255,200,0,0.2)]">
+            {/* Decorative corner */}
+            <div className="absolute top-0 right-0 p-4 opacity-20"><HelpCircle size={100} /></div>
+            
+            <h2 className="text-4xl font-black text-yellow-400 mb-8 tracking-tighter">MISSION BRIEFING</h2>
+            
+            <div className="space-y-6 text-gray-300 text-sm relative z-10">
+              <div className="flex gap-4">
+                <div className="w-12 h-12 bg-yellow-400/10 rounded flex items-center justify-center shrink-0 border border-yellow-400/30">
+                  <RefreshCw className="text-yellow-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-lg mb-1">THE LOOP</h3>
+                  <p>You play 3 Rounds. Every move you make is RECORDED and replayed by Ghosts in the next round.</p>
+                </div>
+              </div>
+
+              <div className="flex gap-4">
+                <div className="w-12 h-12 bg-red-400/10 rounded flex items-center justify-center shrink-0 border border-red-400/30">
+                  <Zap className="text-red-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-lg mb-1">THE PARADOX</h3>
+                  <p>Ghosts are SOLID. You can kill your past self to save your future. If a Ghost dies, its timeline ends.</p>
+                </div>
+              </div>
+            </div>
+
+            <button 
+              onClick={() => setUiState(s => ({...s, showHelp: false}))}
+              className="w-full mt-8 bg-yellow-500 text-black font-bold py-4 rounded hover:bg-white hover:scale-[1.02] transition-all duration-200 tracking-widest text-xl"
+            >
+              INITIATE SEQUENCE
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 3. GAME OVER */}
+      {uiState.phase === 'gameover' && (
+        <div className="absolute inset-0 z-50 bg-black/95 flex flex-col items-center justify-center">
+          <div className="text-center space-y-8 animate-in fade-in zoom-in duration-500">
+            <h2 className="text-8xl font-black text-transparent bg-clip-text bg-gradient-to-b from-red-500 to-purple-900 tracking-tighter filter drop-shadow-[0_0_20px_rgba(255,0,0,0.5)]">
+              TIMELINE<br/>COLLAPSED
+            </h2>
+            
+            <div className="flex flex-col items-center gap-4">
+              <Trophy size={64} className="text-yellow-400 animate-bounce" />
+              <div className="text-4xl text-white font-bold tracking-widest">
+                {uiState.winner === 0 ? "TEMPORAL STALEMATE" : `PLAYER ${uiState.winner} VICTORIOUS`}
+              </div>
+              <div className="text-xl text-gray-500 font-mono">
+                FINAL SCORE :: {uiState.p1Score} - {uiState.p2Score}
+              </div>
+            </div>
+
+            <button 
+              onClick={restartGame}
+              className="px-12 py-4 bg-white text-black font-black text-xl rounded-full hover:bg-cyan-400 hover:shadow-[0_0_30px_cyan] transition-all"
+            >
+              REBOOT SYSTEM
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
